@@ -31,35 +31,8 @@ import (
 
 	"github.com/googleapis/enterprise-certificate-proxy/internal/signer/linux/pkcs11"
 	"github.com/googleapis/enterprise-certificate-proxy/internal/signer/util"
+	"github.com/googleapis/enterprise-certificate-proxy/internal/signer/util/log_util"
 )
-
-
-// If ECP Logging is enabled return true
-// Otherwise return false
-func enabledECPLogging() bool {
-	if os.Getenv("ENABLE_ENTERPRISE_CERTIFICATE_LOGS") != "" {
-		return true
-	}
-	return false
-}
-
-func ecpLogf(format string, v ...any) {
-	if enabledECPLogging() {
-		log.Printf(format, v...)
-	}
-}
-
-func ecpFatalln(v any) {
-	if enabledECPLogging() {
-		log.Fatalln(v)
-	}
-}
-
-func ecpFatalf(format string, v any) {
-	if enabledECPLogging() {
-		log.Fatalf(format, v)
-	}
-}
 
 func init() {
 	gob.Register(crypto.SHA256)
@@ -141,22 +114,22 @@ func (k *EnterpriseCertSigner) Decrypt(args DecryptArgs, resp *[]byte) (err erro
 
 func main() {
 	if len(os.Args) != 2 {
-		ecpFatalln("Signer is not meant to be invoked manually, exiting...")
+		log_util.ecpFatalln("Signer is not meant to be invoked manually, exiting...")
 	}
 	configFilePath := os.Args[1]
 	config, err := util.LoadConfig(configFilePath)
 	if err != nil {
-		ecpFatalf("Failed to load enterprise cert config: %v", err)
+		log_util.ecpFatalf("Failed to load enterprise cert config: %v", err)
 	}
 
 	enterpriseCertSigner := new(EnterpriseCertSigner)
 	enterpriseCertSigner.key, err = pkcs11.Cred(config.CertConfigs.PKCS11.PKCS11Module, config.CertConfigs.PKCS11.Slot, config.CertConfigs.PKCS11.Label, config.CertConfigs.PKCS11.UserPin)
 	if err != nil {
-		ecpFatalf("Failed to initialize enterprise cert signer using pkcs11: %v", err)
+		log_util.ecpFatalf("Failed to initialize enterprise cert signer using pkcs11: %v", err)
 	}
 
 	if err := rpc.Register(enterpriseCertSigner); err != nil {
-		ecpFatalf("Failed to register enterprise cert signer with net/rpc: %v", err)
+		log_util.ecpFatalf("Failed to register enterprise cert signer with net/rpc: %v", err)
 	}
 
 	// If the parent process dies, we should exit.
@@ -165,7 +138,7 @@ func main() {
 	go func() {
 		for {
 			if os.Getppid() == 1 {
-				ecpFatalln("Enterprise cert signer's parent process died, exiting...")
+				log_util.ecpFatalln("Enterprise cert signer's parent process died, exiting...")
 			}
 			time.Sleep(time.Second)
 		}
