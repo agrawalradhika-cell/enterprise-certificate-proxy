@@ -26,19 +26,16 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"os"
 	"os/signal"
 	"regexp"
 	"syscall"
 	"time"
 
-	"google3/third_party/golang/github_com/googleapis/enterprise_certificate_proxy/v/v0/client/client"
+	"github.com/googleapis/enterprise-certificate-proxy/client"
 )
 
 const (
@@ -71,17 +68,6 @@ type AppConfig struct {
 	EnterpriseCertificateFilePath    string
 	GcloudConfiguredUpstreamProxyURL string
 	NonceToken                       string
-}
-
-// If ECP Logging is enabled return true
-// Otherwise return false
-func enableECPLogging() bool {
-	if os.Getenv("ENABLE_ENTERPRISE_CERTIFICATE_LOGS") != "" {
-		return true
-	}
-
-	log.SetOutput(io.Discard)
-	return false
 }
 
 func (cfg *AppConfig) validate() error {
@@ -147,7 +133,6 @@ type ErrorResponse struct {
 // and writes it to the http.ResponseWriter with the specified status code.
 // It also sets a custom header to indicate the error originated from this proxy.
 func writeError(w http.ResponseWriter, originalError error, errorMsg string, statusCode int) {
-	enableECPLogging()
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set(ecpInternalErrorHeader, "true")
 	w.WriteHeader(statusCode)
@@ -159,6 +144,7 @@ func writeError(w http.ResponseWriter, originalError error, errorMsg string, sta
 	}
 
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
+                // TODO: Temporarily disable the logging to avoid customer noise, will add it back in the future with a proper logging library.
 		log.Printf("Failed to write error response: %v", err)
 	}
 }
@@ -173,7 +159,6 @@ func isAllowedHost(allowedHostsRegex *regexp.Regexp, host string) bool {
 // configured to perform mTLS using a credential loaded from the ECP client.
 // It also configures an optional upstream proxy if one is provided in the configuration.
 func newECPProxyTransport(proxyConfig *ProxyConfig) http.RoundTripper {
-	enableECPLogging()
 	transport := &http.Transport{
 		TLSClientConfig:       proxyConfig.TlsConfig,
 		TLSHandshakeTimeout:   proxyConfig.TLSHandshakeTimeout,
@@ -198,7 +183,6 @@ func newECPProxyTransport(proxyConfig *ProxyConfig) http.RoundTripper {
 // performs validation on the incoming request to ensure it is well-formed
 // and targeting an allowed host.
 func newECPProxyHandler(proxyConfig *ProxyConfig, transport http.RoundTripper) http.Handler {
-	enableECPLogging()
 	proxy := &httputil.ReverseProxy{
 		// Director modifies the request just before it is sent to the target.
 		// It reads the target host from our custom header, sets the request URL,
@@ -248,7 +232,6 @@ func newECPProxyHandler(proxyConfig *ProxyConfig, transport http.RoundTripper) h
 // newReadyzHandler creates an http.Handler for the /readyz endpoint.
 // It writes the nonce token to the response body.
 func newReadyzHandler(nonceToken string) http.Handler {
-	enableECPLogging()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
@@ -261,7 +244,6 @@ func newReadyzHandler(nonceToken string) http.Handler {
 // runServer starts the HTTP server with the given handler and configuration.
 // It listens for OS signals from the provided context to perform a graceful shutdown.
 func runServer(ctx context.Context, proxyConfig *ProxyConfig, handler http.Handler) error {
-	enableECPLogging()
 	server := &http.Server{
 		Addr:    fmt.Sprintf(":%d", proxyConfig.Port),
 		Handler: handler,
@@ -298,7 +280,6 @@ func runServer(ctx context.Context, proxyConfig *ProxyConfig, handler http.Handl
 // run is the main application logic. It initializes the configuration, ECP client,
 // HTTP transport, and proxy handler, then starts the server.
 func run(ctx context.Context, cfg *AppConfig) error {
-	enableECPLogging()
 	log.Print("Starting ECP Proxy...")
 
 	proxyConfig := newDefaultProxyConfig()
@@ -355,7 +336,6 @@ func run(ctx context.Context, cfg *AppConfig) error {
 // that listens for interrupt signals (SIGINT, SIGTERM) to enable graceful
 // shutdown, and then calls the main run function.
 func main() {
-	enableECPLogging()
 	cfg, err := newAppConfigFromFlags()
 	if err != nil {
 		log.Fatalf("ECP Proxy initialization failed due to invalid configuration: %v", err)
