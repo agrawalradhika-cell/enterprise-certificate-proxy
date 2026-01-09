@@ -112,16 +112,17 @@ func newAppConfigFromFlags() (*AppConfig, error) {
 
 // ProxyConfig holds the configuration for the ECPPProxy server.
 type ProxyConfig struct {
-	Port                int            // The port for the ECPPProxy server to listen on.
-	AllowedHostsRegex   *regexp.Regexp // Regex to validate allowed target hosts.
-	TlsConfig           *tls.Config    // TLS configuration for mTLS.
-	UpstreamProxyURL    *url.URL       // Optional upstream proxy URL. This will configure the ECPPProxy transport to use this proxy.
-	TLSHandshakeTimeout time.Duration  // Max duration for TLS handshake to the target.
-	ProxyRequestTimeout time.Duration  // Max duration for the entire proxy request.
-	DialTimeout         time.Duration  // Max duration for establishing a TCP connection.
-	KeepAlivePeriod     time.Duration  // Period for TCP keep-alives.
-	IdleConnTimeout     time.Duration  // Max duration an idle connection is kept alive.
-	ShutdownTimeout     time.Duration  // Max duration to wait for graceful shutdown.
+	Port                   int            // The port for the ECPPProxy server to listen on.
+	AllowedGoogleApisHosts []string       // Explicitly allowed Google API hosts.
+	AllowedHostsRegex      *regexp.Regexp // Regex to validate allowed target hosts.
+	TlsConfig              *tls.Config    // TLS configuration for mTLS.
+	UpstreamProxyURL       *url.URL       // Optional upstream proxy URL. This will configure the ECPPProxy transport to use this proxy.
+	TLSHandshakeTimeout    time.Duration  // Max duration for TLS handshake to the target.
+	ProxyRequestTimeout    time.Duration  // Max duration for the entire proxy request.
+	DialTimeout            time.Duration  // Max duration for establishing a TCP connection.
+	KeepAlivePeriod        time.Duration  // Period for TCP keep-alives.
+	IdleConnTimeout        time.Duration  // Max duration an idle connection is kept alive.
+	ShutdownTimeout        time.Duration  // Max duration to wait for graceful shutdown.
 }
 
 // newDefaultProxyConfig creates a new ProxyConfig with default values for timeouts.
@@ -133,6 +134,9 @@ func newDefaultProxyConfig() *ProxyConfig {
 		KeepAlivePeriod:     defaultKeepAlivePeriod,
 		IdleConnTimeout:     defaultIdleConnTimeout,
 		ShutdownTimeout:     defaultShutdownTimeout,
+		AllowedGoogleApisHosts: []string{
+			"reauth.googleapis.com",
+		},
 	}
 }
 
@@ -164,9 +168,18 @@ func writeError(w http.ResponseWriter, originalError error, errorMsg string, sta
 }
 
 // isAllowedHost checks if the provided host string matches the predefined
-// regular expression for allowed hosts.
-func isAllowedHost(allowedHostsRegex *regexp.Regexp, host string) bool {
-	return allowedHostsRegex.MatchString(host)
+// regular expression for allowed hosts or is one of the explicilty allowed hosts
+func isAllowedHost(allowedHostsRegex *regexp.Regexp, allowedGoogleApisHosts []string, host string) bool {
+	if allowedHostsRegex.MatchString(host) {
+		return true
+	}
+
+	for _, allowedHost := range allowedGoogleApisHosts {
+		if host == allowedHost {
+			return true
+		}
+	}
+	return false
 }
 
 // newECPProxyTransport creates an http.RoundTripper (specifically, an http.Transport)
