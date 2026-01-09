@@ -113,8 +113,8 @@ func newAppConfigFromFlags() (*AppConfig, error) {
 // ProxyConfig holds the configuration for the ECPPProxy server.
 type ProxyConfig struct {
 	Port                   int            // The port for the ECPPProxy server to listen on.
-	AllowedGoogleApisHosts []string       // Explicitly allowed Google API hosts.
 	AllowedHostsRegex      *regexp.Regexp // Regex to validate allowed target hosts.
+        AllowedGoogleApisHosts []string       // Explicitly allowed Google API hosts.
 	TlsConfig              *tls.Config    // TLS configuration for mTLS.
 	UpstreamProxyURL       *url.URL       // Optional upstream proxy URL. This will configure the ECPPProxy transport to use this proxy.
 	TLSHandshakeTimeout    time.Duration  // Max duration for TLS handshake to the target.
@@ -248,7 +248,7 @@ func newECPProxyHandler(proxyConfig *ProxyConfig, transport http.RoundTripper) h
 			return
 		}
 
-		if !isAllowedHost(proxyConfig.AllowedHostsRegex, targetHost) {
+		if !isAllowedHost(proxyConfig.AllowedHostsRegex, proxyConfig.AllowedGoogleApisHosts, targetHost) {
 			writeError(w, fmt.Errorf("target host %q is not allowed", targetHost), "Forbidden", http.StatusForbidden)
 			return
 		}
