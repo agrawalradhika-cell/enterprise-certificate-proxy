@@ -37,9 +37,9 @@ func TestLoggerLevels(t *testing.T) {
 	}
 
 	tests := []struct {
-		name     string
-		level    LogLevel
-		funcs    []logFunc
+		name  string
+		level LogLevel
+		funcs []logFunc
 	}{
 		{
 			name:  "Trace level",
@@ -114,7 +114,7 @@ func TestInit(t *testing.T) {
 		expectedLevel LogLevel
 	}{
 		{"", LevelOff},
-                {"FALSE", LevelOff},
+		{"FALSE", LevelOff},
 		{"false", LevelOff},
 		{"0", LevelOff},
 		{"TRACE", LevelTrace},
@@ -145,7 +145,7 @@ func TestInit(t *testing.T) {
 				switch strings.ToUpper(flag) {
 				case "FALSE", "0":
 					currentLevel = LevelOff
-                                case "TRACE":
+				case "TRACE":
 					currentLevel = LevelTrace
 				case "DEBUG":
 					currentLevel = LevelDebug

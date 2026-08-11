@@ -40,7 +40,7 @@ func init() {
 	flag := os.Getenv("ENABLE_ENTERPRISE_CERTIFICATE_LOGS")
 	if flag != "" {
 		switch strings.ToUpper(flag) {
-                case "FALSE", "0":
+		case "FALSE", "0":
 			currentLevel = LevelOff
 		case "TRACE":
 			currentLevel = LevelTrace
