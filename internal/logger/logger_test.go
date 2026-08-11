@@ -114,6 +114,9 @@ func TestInit(t *testing.T) {
 		expectedLevel LogLevel
 	}{
 		{"", LevelOff},
+                {"FALSE", LevelOff},
+		{"false", LevelOff},
+		{"0", LevelOff},
 		{"TRACE", LevelTrace},
 		{"trace", LevelTrace},
 		{"DEBUG", LevelDebug},
@@ -134,15 +137,15 @@ func TestInit(t *testing.T) {
 			} else {
 				os.Setenv("ENABLE_ENTERPRISE_CERTIFICATE_LOGS", tt.envValue)
 			}
-			
 			// We must reset the level to test init parsing
 			currentLevel = LevelOff
-			
 			// Simulate init behavior manually for tests
 			flag := os.Getenv("ENABLE_ENTERPRISE_CERTIFICATE_LOGS")
 			if flag != "" {
 				switch strings.ToUpper(flag) {
-				case "TRACE":
+				case "FALSE", "0":
+					currentLevel = LevelOff
+                                case "TRACE":
 					currentLevel = LevelTrace
 				case "DEBUG":
 					currentLevel = LevelDebug
