@@ -424,10 +424,18 @@ func TestMuxRouting(t *testing.T) {
 	nonceToken := "test-nonce"
 	mockRT := &mockRoundTripper{}
 
-	// Create a ServeMux and register handlers
-	mux := http.NewServeMux()
-	mux.Handle("/readyz", newReadyzHandler(nonceToken))
-	mux.Handle("/", newECPProxyHandler(mockRT))
+	// Create the handlers (mirroring the change in main.go)
+	readyz := newReadyzHandler(nonceToken)
+	ecpProxy := newECPProxyHandler(mockRT)
+
+	// Use the new custom HandlerFunc instead of ServeMux
+	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/readyz" {
+			readyz.ServeHTTP(w, r)
+			return
+		}
+		ecpProxy.ServeHTTP(w, r)
+	})
 
 	t.Run("Test /readyz endpoint", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
@@ -442,7 +450,6 @@ func TestMuxRouting(t *testing.T) {
 		}
 	})
 
-	// Request to another path (should go to proxy)
 	t.Run("Test /some/path endpoint", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/some/path", nil)
 		req.Header.Set(targetHostHeader, "storage.mtls.googleapis.com")
@@ -457,6 +464,27 @@ func TestMuxRouting(t *testing.T) {
 		}
 		if mockRT.capturedRequest.URL.Path != "/some/path" {
 			t.Errorf("Expected path %q, got %q", "/some/path", mockRT.capturedRequest.URL.Path)
+		}
+	})
+
+	t.Run("Test endpoint with double slashes (Fixes b/525049142)", func(t *testing.T) {
+		// Reset the mock captured request
+		mockRT.capturedRequest = nil
+		uriWithPathWithDoubleSlashes := "/resources/https://us-central1-docker.pkg.dev/some/image"
+		req := httptest.NewRequest(http.MethodGet, uriWithPathWithDoubleSlashes, nil)
+		req.Header.Set(targetHostHeader, "containeranalysis.mtls.googleapis.com")
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Errorf("Expected status code %d for proxy, got %d (Make sure path cleaning is disabled)", http.StatusOK, rr.Code)
+		}
+		if mockRT.capturedRequest == nil {
+			t.Fatal("Proxy handler was not called")
+		}
+		// Confirm the // was preserved and successfully forwarded
+		if mockRT.capturedRequest.URL.Path != uriWithPathWithDoubleSlashes {
+			t.Errorf("Expected path %q, got %q", uriWithPathWithDoubleSlashes, mockRT.capturedRequest.URL.Path)
 		}
 	})
 }

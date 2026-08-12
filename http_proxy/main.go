@@ -322,15 +322,17 @@ func run(ctx context.Context, cfg *AppConfig) error {
 		DefaultTransport: defaultTransport,
 	}
 
-	// Create a ServeMux to route requests.
-	mux := http.NewServeMux()
+	// Create the individual handlers
+	readyz := newReadyzHandler(cfg.NonceToken)
+	ecpProxy := newECPProxyHandler(routingTransport)
 
-	// The /readyz endpoint returns the nonce token for authentication.
-	mux.Handle("/readyz", newReadyzHandler(cfg.NonceToken))
-
-	// The main ecp proxy handler handles all other requests.
-	mux.Handle("/", newECPProxyHandler(routingTransport))
-
+	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/readyz" {
+			readyz.ServeHTTP(w, r)
+			return
+		}
+		ecpProxy.ServeHTTP(w, r)
+	})
 	// Run the server
 	return runServer(ctx, proxyConfig, mux)
 }
