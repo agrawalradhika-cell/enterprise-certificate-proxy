@@ -326,15 +326,15 @@ func run(ctx context.Context, cfg *AppConfig) error {
 	readyz := newReadyzHandler(cfg.NonceToken)
 	ecpProxy := newECPProxyHandler(routingTransport)
 
-	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/readyz" {
+	router := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/readyz" && r.Header.Get(targetHostHeader) == "" {
 			readyz.ServeHTTP(w, r)
 			return
 		}
 		ecpProxy.ServeHTTP(w, r)
 	})
 	// Run the server
-	return runServer(ctx, proxyConfig, mux)
+	return runServer(ctx, proxyConfig, router)
 }
 
 // main is the entry point of the application. It parses flags, sets up a context

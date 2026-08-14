@@ -420,7 +420,7 @@ func TestReadyzHandler(t *testing.T) {
 	}
 }
 
-func TestMuxRouting(t *testing.T) {
+func TestRouter(t *testing.T) {
 	nonceToken := "test-nonce"
 	mockRT := &mockRoundTripper{}
 
@@ -428,8 +428,7 @@ func TestMuxRouting(t *testing.T) {
 	readyz := newReadyzHandler(nonceToken)
 	ecpProxy := newECPProxyHandler(mockRT)
 
-	// Use the new custom HandlerFunc instead of ServeMux
-	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	router := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/readyz" {
 			readyz.ServeHTTP(w, r)
 			return
