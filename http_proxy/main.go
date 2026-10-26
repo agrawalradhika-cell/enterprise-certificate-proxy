@@ -31,6 +31,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -57,6 +58,30 @@ const (
 	defaultIdleConnTimeout     = 30 * time.Second
 	defaultShutdownTimeout     = 5 * time.Second
 )
+
+// allowedMtlsHostsRegex validates whether a target host is an allowed Google mTLS endpoint:
+// - *.mtls.googleapis.com and *.mtls.sandbox.googleapis.com
+// - *.mtls.*.goog (e.g., *.mtls.apis-tpczero.goog, *.mtls.tpczero.goog)
+// - mtls.*.cloudproxy.app (e.g., mtls.tunnel.cloudproxy.app)
+var allowedMtlsHostsRegex = regexp.MustCompile(`^(?:[a-z0-9-]+(?:\.[a-z0-9-]+)*\.mtls(?:\.sandbox)?\.googleapis\.com|[a-z0-9-]+(?:\.[a-z0-9-]+)*\.mtls\.[a-z0-9-]+(?:\.[a-z0-9-]+)*\.goog|mtls\.[a-z0-9-]+(?:\.[a-z0-9-]+)*\.cloudproxy\.app)(?::[0-9]{1,5})?$`)
+
+// allowedNonMtlsHostsRegex validates whether a target host is an allowed non-mTLS Google endpoint
+// for fallback requests routed via DefaultTransport (without client certificate).
+var allowedNonMtlsHostsRegex = regexp.MustCompile(`^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:googleapis\.com|goog|cloudproxy\.app|pkg\.dev|gcr\.io)(?::[0-9]{1,5})?$`)
+
+// isMtlsHost checks if the provided host matches the allowed Google mTLS endpoint patterns.
+func isMtlsHost(host string) bool {
+	return allowedMtlsHostsRegex.MatchString(strings.ToLower(host))
+}
+
+// isAllowedHost checks if the provided target host is an allowed Google mTLS or non-mTLS endpoint.
+func isAllowedHost(host string) bool {
+	lowerHost := strings.ToLower(host)
+	if strings.Contains(lowerHost, ".mtls.") || strings.HasPrefix(lowerHost, "mtls.") {
+		return isMtlsHost(lowerHost)
+	}
+	return allowedNonMtlsHostsRegex.MatchString(lowerHost)
+}
 
 // AppConfig holds the application configuration parsed from command-line flags.
 type AppConfig struct {
@@ -174,10 +199,11 @@ type RoutingTransport struct {
 
 // RoundTrip executes a single HTTP transaction, routing it to the appropriate transport.
 func (t *RoutingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Route to ECP transport (mTLS) if the host is an mTLS endpoint.
-	// - Contains ".mtls." matches standard Google API mTLS hosts (e.g., compute.mtls.googleapis.com).
-	// - Starts with "mtls." matches IAP tunnel WebSocket hosts (e.g., mtls.tunnel.cloudproxy.app).
-	if strings.Contains(req.URL.Host, ".mtls.") || strings.HasPrefix(req.URL.Host, "mtls.") {
+	// Route to ECP transport (mTLS) only if the host is an allowed Google mTLS endpoint.
+	// - *.mtls.googleapis.com / *.mtls.sandbox.googleapis.com (e.g., compute.mtls.googleapis.com)
+	// - *.mtls.*.goog (e.g., foo.mtls.apis-tpczero.goog)
+	// - mtls.*.cloudproxy.app (e.g., mtls.tunnel.cloudproxy.app)
+	if isMtlsHost(req.URL.Host) {
 		return t.ECPTransport.RoundTrip(req)
 	}
 	return t.DefaultTransport.RoundTrip(req)
@@ -221,6 +247,10 @@ func newECPProxyHandler(transport http.RoundTripper) http.Handler {
 			writeError(w, fmt.Errorf("missing %s header", targetHostHeader), "Bad Request", http.StatusBadRequest)
 			return
 		}
+		if !isAllowedHost(targetHost) {
+			writeError(w, fmt.Errorf("target host %q is not allowed", targetHost), "Forbidden", http.StatusForbidden)
+			return
+		}
 
 		// If validation passes, let the ReverseProxy handle the request.
 		proxy.ServeHTTP(w, r)
@@ -240,23 +270,45 @@ func newReadyzHandler(nonceToken string) http.Handler {
 }
 
 // runServer starts the HTTP server with the given handler and configuration.
-// It listens for OS signals from the provided context to perform a graceful shutdown.
+// It binds explicitly to the loopback interfaces (127.0.0.1 and ::1) and listens
+// for OS signals from the provided context to perform a graceful shutdown.
 func runServer(ctx context.Context, proxyConfig *ProxyConfig, handler http.Handler) error {
+	ipv4Addr := fmt.Sprintf("127.0.0.1:%d", proxyConfig.Port)
+	ipv6Addr := fmt.Sprintf("[::1]:%d", proxyConfig.Port)
+
 	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", proxyConfig.Port),
+		Addr:    ipv4Addr,
 		Handler: handler,
 	}
 
-	// Channel to receive errors from the server's ListenAndServe goroutine.
-	errChan := make(chan error, 1)
+	ipv4Listener, err := net.Listen("tcp4", ipv4Addr)
+	if err != nil {
+		return fmt.Errorf("failed to start proxy server on %s: %w", ipv4Addr, err)
+	}
 
-	// Run the server in a goroutine.
+	// Channel to receive errors from the server's Serve goroutines.
+	errChan := make(chan error, 2)
+
+	// Run the IPv4 loopback server in a goroutine.
 	go func() {
-		logger.Infof("Starting proxy server on port %d", proxyConfig.Port)
-		if err := server.ListenAndServe(); err != http.ErrServerClosed {
-			errChan <- fmt.Errorf("failed to start proxy server: %w", err)
+		logger.Infof("Starting proxy server on %s", ipv4Addr)
+		if err := server.Serve(ipv4Listener); err != http.ErrServerClosed {
+			errChan <- fmt.Errorf("failed to start proxy server on %s: %w", ipv4Addr, err)
 		}
 	}()
+
+	// Also bind to IPv6 loopback (::1) when available so localhost resolution
+	// to ::1 works while never binding to 0.0.0.0 or ::.
+	if ipv6Listener, err := net.Listen("tcp6", ipv6Addr); err == nil {
+		go func() {
+			logger.Infof("Starting proxy server on %s", ipv6Addr)
+			if err := server.Serve(ipv6Listener); err != http.ErrServerClosed {
+				errChan <- fmt.Errorf("failed to start proxy server on %s: %w", ipv6Addr, err)
+			}
+		}()
+	} else {
+		logger.Infof("IPv6 loopback listener on %s not started: %v", ipv6Addr, err)
+	}
 
 	// Block until we receive an error or a shutdown signal from the context.
 	select {

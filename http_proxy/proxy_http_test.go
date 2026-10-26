@@ -179,12 +179,12 @@ func TestECPProxyWithHTTPClient(t *testing.T) {
 	passthroughProxyServer := httptest.NewServer(http.HandlerFunc(ProxyHandler))
 	defer passthroughProxyServer.Close()
 
-	// To trick the proxy into selecting the ECPTransport (mTLS), the target host must contain ".mtls.".
-	// We replace the local IP (127.0.0.1) from our mock servers with "test.mtls.local" in the request headers.
-	validMTLSBackendServerHost := strings.Replace(validMTLSBackendServer.Listener.Addr().String(), "127.0.0.1", "test.mtls.local", 1)
-	mtlsValidMTLSBackendServerHost := strings.Replace(validMTLSBackendServer.Listener.Addr().String(), "127.0.0.1", "mtls.test.local", 1)
-	backendServerReturnsErrorHost := strings.Replace(backendServerReturnsError.Listener.Addr().String(), "127.0.0.1", "test.mtls.local", 1)
-	plainBackendServerHost := plainBackendServer.Listener.Addr().String()
+	// To route via ECPTransport (mTLS), the target host must match an allowed Google mTLS domain.
+	// We replace the local IP (127.0.0.1) from our mock servers with allowed Google domains in the request headers.
+	validMTLSBackendServerHost := strings.Replace(validMTLSBackendServer.Listener.Addr().String(), "127.0.0.1", "test.mtls.googleapis.com", 1)
+	mtlsValidMTLSBackendServerHost := strings.Replace(validMTLSBackendServer.Listener.Addr().String(), "127.0.0.1", "mtls.tunnel.cloudproxy.app", 1)
+	backendServerReturnsErrorHost := strings.Replace(backendServerReturnsError.Listener.Addr().String(), "127.0.0.1", "test.mtls.googleapis.com", 1)
+	plainBackendServerHost := strings.Replace(plainBackendServer.Listener.Addr().String(), "127.0.0.1", "test.googleapis.com", 1)
 	validPassthroughURL := passthroughProxyServer.URL
 	invalidPassthroughURL := "1234-bad-server-mtls.com"
 
@@ -225,11 +225,19 @@ func TestECPProxyWithHTTPClient(t *testing.T) {
 			wantECPProxyError:       false,
 		},
 		{
-			name:                    "invalid target header (dns failure)",
+			name:                    "disallowed target header",
 			ecpMTLSCerts:            certs1,
 			targetHostHeader:        "123-not-allowed-mtls.com",
 			passthroughProxyAddress: "",
-			wantStatusCode:          http.StatusBadGateway,
+			wantStatusCode:          http.StatusForbidden,
+			wantECPProxyError:       true,
+		},
+		{
+			name:                    "disallowed non-google mtls target header",
+			ecpMTLSCerts:            certs1,
+			targetHostHeader:        "foo.mtls.invalid:4443",
+			passthroughProxyAddress: "",
+			wantStatusCode:          http.StatusForbidden,
 			wantECPProxyError:       true,
 		},
 		{
@@ -342,12 +350,13 @@ func TestECPProxyWithHTTPClient(t *testing.T) {
 			}
 			defaultTransport := newTransport(defaultTLSConfig, proxyConfig).(*http.Transport)
 
-			// Because we tricked the proxy with the fake domain "test.mtls.local" above to trigger mTLS,
-			// the actual TCP dial will fail DNS resolution. We use a custom DialContext to intercept this
-			// fake domain and redirect the connection back to 127.0.0.1 where the mock server is listening.
+			// Because we used allowed Google test domains above, the actual TCP dial would fail DNS
+			// resolution. We use a custom DialContext to intercept these test domains and redirect
+			// the connection back to 127.0.0.1 where the mock server is listening.
 			customDialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
-				addr = strings.Replace(addr, "test.mtls.local", "127.0.0.1", 1)
-				addr = strings.Replace(addr, "mtls.test.local", "127.0.0.1", 1)
+				addr = strings.Replace(addr, "test.mtls.googleapis.com", "127.0.0.1", 1)
+				addr = strings.Replace(addr, "mtls.tunnel.cloudproxy.app", "127.0.0.1", 1)
+				addr = strings.Replace(addr, "test.googleapis.com", "127.0.0.1", 1)
 				return (&net.Dialer{
 					Timeout:   proxyConfig.DialTimeout,
 					KeepAlive: proxyConfig.KeepAlivePeriod,
