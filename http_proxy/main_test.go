@@ -17,11 +17,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -228,51 +230,51 @@ func TestNewECPProxyHandler(t *testing.T) {
 		validateDirector   bool
 	}{
 		{
-			name:               "Valid Request",
+			name:               "valid_request",
 			targetHostHeader:   "storage.mtls.googleapis.com",
 			expectedStatusCode: http.StatusOK,
 			expectErrorHeader:  false,
 			validateDirector:   true,
 		},
 		{
-			name:               "Valid Non-mTLS Google API Request",
+			name:               "valid_non_mtls_google_api_request",
 			targetHostHeader:   "oauth2.googleapis.com",
 			expectedStatusCode: http.StatusOK,
 			expectErrorHeader:  false,
 			validateDirector:   true,
 		},
 		{
-			name:               "Missing Target Host Header",
+			name:               "missing_target_host_header",
 			targetHostHeader:   "",
 			expectedStatusCode: http.StatusBadRequest,
 			expectErrorHeader:  true,
 		},
 		{
-			name:               "Disallowed Non-Google mTLS Host",
+			name:               "disallowed_non_google_mtls_host",
 			targetHostHeader:   "foo.mtls.invalid:4443",
 			expectedStatusCode: http.StatusForbidden,
 			expectErrorHeader:  true,
 		},
 		{
-			name:               "Disallowed Non-Google Prefix mTLS Host",
+			name:               "disallowed_non_google_prefix_mtls_host",
 			targetHostHeader:   "mtls.attacker.com",
 			expectedStatusCode: http.StatusForbidden,
 			expectErrorHeader:  true,
 		},
 		{
-			name:               "Disallowed Loopback Target Host",
+			name:               "disallowed_loopback_target_host",
 			targetHostHeader:   "127.0.0.1:8080",
 			expectedStatusCode: http.StatusForbidden,
 			expectErrorHeader:  true,
 		},
 		{
-			name:               "Disallowed External Host",
+			name:               "disallowed_external_host",
 			targetHostHeader:   "evil.com",
 			expectedStatusCode: http.StatusForbidden,
 			expectErrorHeader:  true,
 		},
 		{
-			name:               "ReverseProxy Error Handling",
+			name:               "reverse_proxy_error_handling",
 			targetHostHeader:   "storage.mtls.googleapis.com",
 			expectedStatusCode: http.StatusBadGateway,
 			expectErrorHeader:  true,
@@ -453,34 +455,50 @@ func TestReadyzHandler(t *testing.T) {
 
 func TestRouter(t *testing.T) {
 	nonceToken := "test-nonce"
-	mockRT := &mockRoundTripper{}
 
-	// Create the handlers (mirroring the change in main.go)
-	readyz := newReadyzHandler(nonceToken)
-	ecpProxy := newECPProxyHandler(mockRT)
+	t.Run("readyz_endpoint", func(t *testing.T) {
+		mockRT := &mockRoundTripper{}
+		router := newRouter(newReadyzHandler(nonceToken), newECPProxyHandler(mockRT))
 
-	router := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/readyz" && r.Header.Get(targetHostHeader) == "" {
-			readyz.ServeHTTP(w, r)
-			return
-		}
-		ecpProxy.ServeHTTP(w, r)
-	})
-
-	t.Run("Test /readyz endpoint", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 		rr := httptest.NewRecorder()
 		router.ServeHTTP(rr, req)
 
 		if rr.Code != http.StatusOK {
-			t.Errorf("Expected status code %d for /readyz, got %d", http.StatusOK, rr.Code)
+			t.Errorf("router.ServeHTTP(/readyz) status = %d, want %d", rr.Code, http.StatusOK)
 		}
 		if rr.Body.String() != nonceToken {
-			t.Errorf("Expected body %q for /readyz, got %q", nonceToken, rr.Body.String())
+			t.Errorf("router.ServeHTTP(/readyz) body = %q, want %q", rr.Body.String(), nonceToken)
+		}
+		if mockRT.capturedRequest != nil {
+			t.Error("router.ServeHTTP(/readyz) unexpectedly forwarded request to proxy handler")
 		}
 	})
 
-	t.Run("Test /some/path endpoint", func(t *testing.T) {
+	t.Run("readyz_with_target_host_header_forwards_to_proxy", func(t *testing.T) {
+		mockRT := &mockRoundTripper{}
+		router := newRouter(newReadyzHandler(nonceToken), newECPProxyHandler(mockRT))
+
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		req.Header.Set(targetHostHeader, "storage.mtls.googleapis.com")
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Errorf("router.ServeHTTP(/readyz with target host) status = %d, want %d", rr.Code, http.StatusOK)
+		}
+		if mockRT.capturedRequest == nil {
+			t.Fatal("router.ServeHTTP(/readyz with target host) did not call proxy handler")
+		}
+		if mockRT.capturedRequest.URL.Path != "/readyz" {
+			t.Errorf("capturedRequest.URL.Path = %q, want %q", mockRT.capturedRequest.URL.Path, "/readyz")
+		}
+	})
+
+	t.Run("some_path_endpoint", func(t *testing.T) {
+		mockRT := &mockRoundTripper{}
+		router := newRouter(newReadyzHandler(nonceToken), newECPProxyHandler(mockRT))
+
 		req := httptest.NewRequest(http.MethodGet, "/some/path", nil)
 		req.Header.Set(targetHostHeader, "storage.mtls.googleapis.com")
 		rr := httptest.NewRecorder()
@@ -497,9 +515,10 @@ func TestRouter(t *testing.T) {
 		}
 	})
 
-	t.Run("Test endpoint with double slashes (Fixes b/525049142)", func(t *testing.T) {
-		// Reset the mock captured request
-		mockRT.capturedRequest = nil
+	t.Run("endpoint_with_double_slashes", func(t *testing.T) {
+		mockRT := &mockRoundTripper{}
+		router := newRouter(newReadyzHandler(nonceToken), newECPProxyHandler(mockRT))
+
 		uriWithPathWithDoubleSlashes := "/resources/https://us-central1-docker.pkg.dev/some/image"
 		req := httptest.NewRequest(http.MethodGet, uriWithPathWithDoubleSlashes, nil)
 		req.Header.Set(targetHostHeader, "containeranalysis.mtls.googleapis.com")
@@ -520,90 +539,68 @@ func TestRouter(t *testing.T) {
 }
 
 func TestRoutingTransport(t *testing.T) {
-	ecpRT := &mockRoundTripper{}
-	defaultRT := &mockRoundTripper{}
-
-	routingRT := &RoutingTransport{
-		ECPTransport:     ecpRT,
-		DefaultTransport: defaultRT,
-	}
-
 	tests := []struct {
-		name        string
-		host        string
-		wantECP     bool
-		wantDefault bool
+		name    string
+		host    string
+		wantECP bool
 	}{
 		{
-			name:        "mTLS Host",
-			host:        "storage.mtls.googleapis.com",
-			wantECP:     true,
-			wantDefault: false,
+			name:    "mtls_host",
+			host:    "storage.mtls.googleapis.com",
+			wantECP: true,
 		},
 		{
-			name:        "mTLS Sandbox Host",
-			host:        "pubsub.mtls.sandbox.googleapis.com",
-			wantECP:     true,
-			wantDefault: false,
+			name:    "mtls_sandbox_host",
+			host:    "pubsub.mtls.sandbox.googleapis.com",
+			wantECP: true,
 		},
 		{
-			name:        "mTLS TPC Host",
-			host:        "foo.mtls.apis-tpczero.goog",
-			wantECP:     true,
-			wantDefault: false,
+			name:    "mtls_tpc_host",
+			host:    "foo.mtls.apis-tpczero.goog",
+			wantECP: true,
 		},
 		{
-			name:        "Regular Host",
-			host:        "storage.googleapis.com",
-			wantECP:     false,
-			wantDefault: true,
+			name:    "regular_host",
+			host:    "storage.googleapis.com",
+			wantECP: false,
 		},
 		{
-			name:        "Non-Google Host with mtls",
-			host:        "example.mtls.com",
-			wantECP:     false,
-			wantDefault: true,
+			name:    "non_google_host_with_mtls",
+			host:    "example.mtls.com",
+			wantECP: false,
 		},
 		{
-			name:        "Non-Google Host starting with mtls",
-			host:        "mtls.attacker.com",
-			wantECP:     false,
-			wantDefault: true,
+			name:    "non_google_host_starting_with_mtls",
+			host:    "mtls.attacker.com",
+			wantECP: false,
 		},
 		{
-			name:        "Host starting with mtls (WebSocket)",
-			host:        "mtls.tunnel.cloudproxy.app",
-			wantECP:     true,
-			wantDefault: false,
+			name:    "host_starting_with_mtls_websocket",
+			host:    "mtls.tunnel.cloudproxy.app",
+			wantECP: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Reset mocks
-			ecpRT.capturedRequest = nil
-			defaultRT.capturedRequest = nil
+			ecpRT := &mockRoundTripper{}
+			defaultRT := &mockRoundTripper{}
+			routingRT := &RoutingTransport{
+				ECPTransport:     ecpRT,
+				DefaultTransport: defaultRT,
+			}
 
 			req := httptest.NewRequest(http.MethodGet, "https://"+tt.host, nil)
 			_, err := routingRT.RoundTrip(req)
 			if err != nil {
-				t.Fatalf("RoundTrip failed: %v", err)
+				t.Fatalf("RoundTrip(%q) failed: %v", tt.host, err)
 			}
 
-			if tt.wantECP {
-				if ecpRT.capturedRequest == nil {
-					t.Error("Expected ECP transport to be used, but it wasn't")
-				}
-				if defaultRT.capturedRequest != nil {
-					t.Error("Expected Default transport NOT to be used, but it was")
-				}
-			} else if tt.wantDefault {
-				if defaultRT.capturedRequest == nil {
-					t.Error("Expected Default transport to be used, but it wasn't")
-				}
-				if ecpRT.capturedRequest != nil {
-					t.Error("Expected ECP transport NOT to be used, but it was")
-				}
+			if gotECP := ecpRT.capturedRequest != nil; gotECP != tt.wantECP {
+				t.Errorf("RoutingTransport.RoundTrip(%q) used ECPTransport = %v, want %v", tt.host, gotECP, tt.wantECP)
+			}
+			if gotDefault := defaultRT.capturedRequest != nil; gotDefault == tt.wantECP {
+				t.Errorf("RoutingTransport.RoundTrip(%q) used DefaultTransport = %v, want %v", tt.host, gotDefault, !tt.wantECP)
 			}
 		})
 	}
@@ -614,85 +611,121 @@ func TestIsAllowedHost(t *testing.T) {
 		name        string
 		host        string
 		wantAllowed bool
-		wantMtls    bool
+		wantMTLS    bool
 	}{
 		{
-			name:        "Standard mTLS Googleapis Host",
+			name:        "standard_mtls_googleapis_host",
 			host:        "storage.mtls.googleapis.com",
 			wantAllowed: true,
-			wantMtls:    true,
+			wantMTLS:    true,
 		},
 		{
-			name:        "Regional mTLS Googleapis Host",
+			name:        "regional_mtls_googleapis_host",
 			host:        "us-central1-aiplatform.mtls.googleapis.com",
 			wantAllowed: true,
-			wantMtls:    true,
+			wantMTLS:    true,
 		},
 		{
-			name:        "Sandbox mTLS Googleapis Host",
+			name:        "sandbox_mtls_googleapis_host",
 			host:        "pubsub.mtls.sandbox.googleapis.com",
 			wantAllowed: true,
-			wantMtls:    true,
+			wantMTLS:    true,
 		},
 		{
-			name:        "TPC mTLS Host",
+			name:        "tpc_mtls_host",
 			host:        "foo.mtls.apis-tpczero.goog",
 			wantAllowed: true,
-			wantMtls:    true,
+			wantMTLS:    true,
 		},
 		{
-			name:        "IAP Cloudproxy mTLS Host",
+			name:        "iap_cloudproxy_mtls_host",
 			host:        "mtls.tunnel.cloudproxy.app",
 			wantAllowed: true,
-			wantMtls:    true,
+			wantMTLS:    true,
 		},
 		{
-			name:        "Standard Non-mTLS Googleapis Host",
+			name:        "allowed_mtls_host_with_port_and_mixed_case",
+			host:        "Storage.MTLS.GoogleAPIs.com:443",
+			wantAllowed: true,
+			wantMTLS:    true,
+		},
+		{
+			name:        "standard_non_mtls_googleapis_host",
 			host:        "oauth2.googleapis.com",
 			wantAllowed: true,
-			wantMtls:    false,
+			wantMTLS:    false,
 		},
 		{
-			name:        "Artifact Registry pkg.dev Host",
+			name:        "artifact_registry_pkg_dev_host",
 			host:        "us-central1-docker.pkg.dev",
 			wantAllowed: true,
-			wantMtls:    false,
+			wantMTLS:    false,
 		},
 		{
-			name:        "Disallowed Non-Google mTLS Host",
+			name:        "bare_gcr_io_host",
+			host:        "gcr.io",
+			wantAllowed: true,
+			wantMTLS:    false,
+		},
+		{
+			name:        "regional_gcr_io_host",
+			host:        "us.gcr.io",
+			wantAllowed: true,
+			wantMTLS:    false,
+		},
+		{
+			name:        "disallowed_non_google_mtls_host",
 			host:        "foo.mtls.invalid:4443",
 			wantAllowed: false,
-			wantMtls:    false,
+			wantMTLS:    false,
 		},
 		{
-			name:        "Disallowed Non-Google Prefix mTLS Host",
+			name:        "disallowed_non_google_prefix_mtls_host",
 			host:        "mtls.attacker.com",
 			wantAllowed: false,
-			wantMtls:    false,
+			wantMTLS:    false,
 		},
 		{
-			name:        "Disallowed Spoofed Suffix Host",
+			name:        "disallowed_spoofed_suffix_host",
 			host:        "storage.mtls.googleapis.com.attacker.com",
 			wantAllowed: false,
-			wantMtls:    false,
+			wantMTLS:    false,
 		},
 		{
-			name:        "Disallowed mTLS on Non-mTLS Google Domain",
-			host:        "foo.mtls.google.com",
+			name:        "disallowed_mtls_subdomain_on_allowed_non_mtls_google_domain",
+			host:        "foo.mtls.pkg.dev",
 			wantAllowed: false,
-			wantMtls:    false,
+			wantMTLS:    false,
 		},
 		{
-			name:        "Disallowed Loopback IP",
+			name:        "disallowed_mtls_prefix_on_allowed_non_mtls_google_domain",
+			host:        "mtls.googleapis.com",
+			wantAllowed: false,
+			wantMTLS:    false,
+		},
+		{
+			name:        "disallowed_empty_port_suffix",
+			host:        "storage.mtls.googleapis.com:",
+			wantAllowed: false,
+			wantMTLS:    false,
+		},
+		{
+			name:        "disallowed_six_digit_port",
+			host:        "storage.mtls.googleapis.com:123456",
+			wantAllowed: false,
+			wantMTLS:    false,
+		},
+		{
+			name:        "disallowed_loopback_ip",
 			host:        "127.0.0.1:8080",
 			wantAllowed: false,
-			wantMtls:    false,
+			wantMTLS:    false,
 		},
 		{
-			name:        "Disallowed Localhost",
+			name:        "disallowed_localhost",
 			host:        "localhost:8080",
 			wantAllowed: false,
-			wantMtls:    false,
+			wantMTLS:    false,
 		},
 	}
 
@@ -701,9 +734,27 @@ func TestIsAllowedHost(t *testing.T) {
 			if got := isAllowedHost(tt.host); got != tt.wantAllowed {
 				t.Errorf("isAllowedHost(%q) = %v, want %v", tt.host, got, tt.wantAllowed)
 			}
-			if got := isMtlsHost(tt.host); got != tt.wantMtls {
-				t.Errorf("isMtlsHost(%q) = %v, want %v", tt.host, got, tt.wantMtls)
+			if got := isMTLSHost(tt.host); got != tt.wantMTLS {
+				t.Errorf("isMTLSHost(%q) = %v, want %v", tt.host, got, tt.wantMTLS)
 			}
 		})
 	}
+}
+
+func TestRunServer_BindsLoopbackAndRejectsPortInUse(t *testing.T) {
+	// Occupy a free IPv4 loopback port to verify runServer returns an error when the port is already bound.
+	occupiedListener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen(127.0.0.1:0) failed: %v", err)
+	}
+	occupiedPort := occupiedListener.Addr().(*net.TCPAddr).Port
+
+	proxyConfig := newDefaultProxyConfig()
+	proxyConfig.Port = occupiedPort
+
+	if err := runServer(context.Background(), proxyConfig, newReadyzHandler("nonce")); err == nil {
+		occupiedListener.Close()
+		t.Fatalf("runServer() on occupied port %d = nil, want non-nil error", occupiedPort)
+	}
+	occupiedListener.Close()
 }
