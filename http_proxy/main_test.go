@@ -28,7 +28,10 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -41,73 +44,94 @@ var (
 
 func TestAppConfigFromFlags(t *testing.T) {
 	tests := []struct {
-		name    string
-		args    []string
-		wantErr bool
-		want    *AppConfig
+		name         string
+		args         []string
+		envAuthToken string
+		wantErr      bool
+		want         *AppConfig
 	}{
 		{
-			name:    "Missing Nonce",
-			args:    []string{"-port", "8080", "-enterprise_certificate_file_path", "/path/to/cert.json"},
-			wantErr: true,
+			name:         "Missing Nonce",
+			args:         []string{"-port", "8080", "-enterprise_certificate_file_path", "/path/to/cert.json"},
+			envAuthToken: "test-auth-token",
+			wantErr:      true,
 		},
 		{
-			name:    "Missing Port",
-			args:    []string{"-enterprise_certificate_file_path", "/path/to/cert.json", "-nonce_token", "abc"},
-			wantErr: true,
+			name:         "Missing Port",
+			args:         []string{"-enterprise_certificate_file_path", "/path/to/cert.json", "-nonce_token", "abc"},
+			envAuthToken: "test-auth-token",
+			wantErr:      true,
 		},
 		{
-			name:    "Invalid Port (zero)",
-			args:    []string{"-port", "0", "-enterprise_certificate_file_path", "/path/to/cert.json", "-nonce_token", "abc"},
-			wantErr: true,
+			name:         "Invalid Port (zero)",
+			args:         []string{"-port", "0", "-enterprise_certificate_file_path", "/path/to/cert.json", "-nonce_token", "abc"},
+			envAuthToken: "test-auth-token",
+			wantErr:      true,
 		},
 		{
-			name:    "Invalid Port (negative)",
-			args:    []string{"-port", "-1", "-enterprise_certificate_file_path", "/path/to/cert.json", "-nonce_token", "abc"},
-			wantErr: true,
+			name:         "Invalid Port (negative)",
+			args:         []string{"-port", "-1", "-enterprise_certificate_file_path", "/path/to/cert.json", "-nonce_token", "abc"},
+			envAuthToken: "test-auth-token",
+			wantErr:      true,
 		},
 		{
-			name:    "Missing Certificate Path",
-			args:    []string{"-port", "8080", "-nonce_token", "abc"},
-			wantErr: false,
+			name:         "Missing Certificate Path",
+			args:         []string{"-port", "8080", "-nonce_token", "abc"},
+			envAuthToken: "test-auth-token",
+			wantErr:      false,
 			want: &AppConfig{
 				Port:       8080,
 				NonceToken: "abc",
+				AuthToken:  "test-auth-token",
 			},
 		},
 		{
-			name:    "Empty Certificate Path",
-			args:    []string{"-port", "8080", "-enterprise_certificate_file_path", "", "-nonce_token", "abc"},
-			wantErr: false,
+			name:         "Empty Certificate Path",
+			args:         []string{"-port", "8080", "-enterprise_certificate_file_path", "", "-nonce_token", "abc"},
+			envAuthToken: "test-auth-token",
+			wantErr:      false,
 			want: &AppConfig{
 				Port:       8080,
 				NonceToken: "abc",
+				AuthToken:  "test-auth-token",
 			},
 		},
 		{
-			name:    "Happy Path with Optional Proxy URL",
-			args:    []string{"-port", "8080", "-enterprise_certificate_file_path", "/path/to/cert.json", "-gcloud_configured_upstream_proxy_url", "http://proxy.example.com", "-nonce_token", "abc"},
-			wantErr: false,
+			name:         "Happy Path with Optional Proxy URL",
+			args:         []string{"-port", "8080", "-enterprise_certificate_file_path", "/path/to/cert.json", "-gcloud_configured_upstream_proxy_url", "http://proxy.example.com", "-nonce_token", "abc"},
+			envAuthToken: "test-auth-token",
+			wantErr:      false,
 			want: &AppConfig{
 				Port:                             8080,
 				EnterpriseCertificateFilePath:    "/path/to/cert.json",
 				GcloudConfiguredUpstreamProxyURL: "http://proxy.example.com",
 				NonceToken:                       "abc",
+				AuthToken:                        "test-auth-token",
 			},
 		},
 		{
-			name:    "Happy Path with Nonce Token",
-			args:    []string{"-port", "8080", "-nonce_token", "my-secret-token"},
-			wantErr: false,
+			name:         "Happy Path with Nonce Token",
+			args:         []string{"-port", "8080", "-nonce_token", "my-secret-token"},
+			envAuthToken: "test-auth-token",
+			wantErr:      false,
 			want: &AppConfig{
 				Port:       8080,
 				NonceToken: "my-secret-token",
+				AuthToken:  "test-auth-token",
 			},
+		},
+		{
+			name:         "Missing Auth Token Env Var",
+			args:         []string{"-port", "8080", "-nonce_token", "abc"},
+			envAuthToken: "",
+			wantErr:      true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(authTokenEnvVar, tt.envAuthToken)
+
 			// Each test needs its own flag set.
 			fs := flag.NewFlagSet(tt.name, flag.ContinueOnError)
 			// Discard output to avoid polluting test logs.
@@ -142,6 +166,9 @@ func TestAppConfigFromFlags(t *testing.T) {
 				}
 				if got.NonceToken != tt.want.NonceToken {
 					t.Errorf("newProxyConfigFromFlags() NonceToken = %v, want %v", got.NonceToken, tt.want.NonceToken)
+				}
+				if got.AuthToken != tt.want.AuthToken {
+					t.Errorf("newProxyConfigFromFlags() AuthToken = %v, want %v", got.AuthToken, tt.want.AuthToken)
 				}
 			}
 		})
@@ -247,30 +274,6 @@ func TestNewECPProxyHandler(t *testing.T) {
 			name:               "missing_target_host_header",
 			targetHostHeader:   "",
 			expectedStatusCode: http.StatusBadRequest,
-			expectErrorHeader:  true,
-		},
-		{
-			name:               "disallowed_non_google_mtls_host",
-			targetHostHeader:   "foo.mtls.invalid:4443",
-			expectedStatusCode: http.StatusForbidden,
-			expectErrorHeader:  true,
-		},
-		{
-			name:               "disallowed_non_google_prefix_mtls_host",
-			targetHostHeader:   "mtls.attacker.com",
-			expectedStatusCode: http.StatusForbidden,
-			expectErrorHeader:  true,
-		},
-		{
-			name:               "disallowed_loopback_target_host",
-			targetHostHeader:   "127.0.0.1:8080",
-			expectedStatusCode: http.StatusForbidden,
-			expectErrorHeader:  true,
-		},
-		{
-			name:               "disallowed_external_host",
-			targetHostHeader:   "evil.com",
-			expectedStatusCode: http.StatusForbidden,
 			expectErrorHeader:  true,
 		},
 		{
@@ -455,10 +458,15 @@ func TestReadyzHandler(t *testing.T) {
 
 func TestRouter(t *testing.T) {
 	nonceToken := "test-nonce"
+	authToken := "test-auth-token"
 
-	t.Run("readyz_endpoint", func(t *testing.T) {
+	newTestRouter := func(mockRT *mockRoundTripper) http.Handler {
+		return newRouter(newReadyzHandler(nonceToken), requireAuthToken(authToken, newECPProxyHandler(mockRT)))
+	}
+
+	t.Run("readyz_endpoint_does_not_require_auth_token", func(t *testing.T) {
 		mockRT := &mockRoundTripper{}
-		router := newRouter(newReadyzHandler(nonceToken), newECPProxyHandler(mockRT))
+		router := newTestRouter(mockRT)
 
 		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 		rr := httptest.NewRecorder()
@@ -470,6 +478,16 @@ func TestRouter(t *testing.T) {
 		if rr.Body.String() != nonceToken {
 			t.Errorf("router.ServeHTTP(/readyz) body = %q, want %q", rr.Body.String(), nonceToken)
 		}
+		if strings.Contains(rr.Body.String(), authToken) {
+			t.Errorf("router.ServeHTTP(/readyz) body = %q, must not expose the auth token", rr.Body.String())
+		}
+		for k, v := range rr.Header() {
+			for _, vv := range v {
+				if strings.Contains(vv, authToken) {
+					t.Errorf("router.ServeHTTP(/readyz) header %s = %q, must not expose the auth token", k, vv)
+				}
+			}
+		}
 		if mockRT.capturedRequest != nil {
 			t.Error("router.ServeHTTP(/readyz) unexpectedly forwarded request to proxy handler")
 		}
@@ -477,10 +495,11 @@ func TestRouter(t *testing.T) {
 
 	t.Run("readyz_with_target_host_header_forwards_to_proxy", func(t *testing.T) {
 		mockRT := &mockRoundTripper{}
-		router := newRouter(newReadyzHandler(nonceToken), newECPProxyHandler(mockRT))
+		router := newTestRouter(mockRT)
 
 		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 		req.Header.Set(targetHostHeader, "storage.mtls.googleapis.com")
+		req.Header.Set(authTokenHeader, authToken)
 		rr := httptest.NewRecorder()
 		router.ServeHTTP(rr, req)
 
@@ -495,12 +514,30 @@ func TestRouter(t *testing.T) {
 		}
 	})
 
+	t.Run("readyz_with_target_host_header_requires_auth_token", func(t *testing.T) {
+		mockRT := &mockRoundTripper{}
+		router := newTestRouter(mockRT)
+
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		req.Header.Set(targetHostHeader, "storage.mtls.googleapis.com")
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("router.ServeHTTP(/readyz with target host, no auth token) status = %d, want %d", rr.Code, http.StatusUnauthorized)
+		}
+		if mockRT.capturedRequest != nil {
+			t.Error("router.ServeHTTP(/readyz with target host, no auth token) unexpectedly forwarded request")
+		}
+	})
+
 	t.Run("some_path_endpoint", func(t *testing.T) {
 		mockRT := &mockRoundTripper{}
-		router := newRouter(newReadyzHandler(nonceToken), newECPProxyHandler(mockRT))
+		router := newTestRouter(mockRT)
 
 		req := httptest.NewRequest(http.MethodGet, "/some/path", nil)
 		req.Header.Set(targetHostHeader, "storage.mtls.googleapis.com")
+		req.Header.Set(authTokenHeader, authToken)
 		rr := httptest.NewRecorder()
 		router.ServeHTTP(rr, req)
 
@@ -513,15 +550,19 @@ func TestRouter(t *testing.T) {
 		if mockRT.capturedRequest.URL.Path != "/some/path" {
 			t.Errorf("Expected path %q, got %q", "/some/path", mockRT.capturedRequest.URL.Path)
 		}
+		if got := mockRT.capturedRequest.Header.Get(authTokenHeader); got != "" {
+			t.Errorf("forwarded request %s header = %q, want it stripped", authTokenHeader, got)
+		}
 	})
 
 	t.Run("endpoint_with_double_slashes", func(t *testing.T) {
 		mockRT := &mockRoundTripper{}
-		router := newRouter(newReadyzHandler(nonceToken), newECPProxyHandler(mockRT))
+		router := newTestRouter(mockRT)
 
 		uriWithPathWithDoubleSlashes := "/resources/https://us-central1-docker.pkg.dev/some/image"
 		req := httptest.NewRequest(http.MethodGet, uriWithPathWithDoubleSlashes, nil)
 		req.Header.Set(targetHostHeader, "containeranalysis.mtls.googleapis.com")
+		req.Header.Set(authTokenHeader, authToken)
 		rr := httptest.NewRecorder()
 		router.ServeHTTP(rr, req)
 
@@ -536,6 +577,92 @@ func TestRouter(t *testing.T) {
 			t.Errorf("Expected path %q, got %q", uriWithPathWithDoubleSlashes, mockRT.capturedRequest.URL.Path)
 		}
 	})
+}
+
+func TestRequireAuthToken(t *testing.T) {
+	const authToken = "test-auth-token"
+	tests := []struct {
+		name           string
+		serverToken    string
+		requestToken   string
+		setHeader      bool
+		wantStatusCode int
+		wantForwarded  bool
+	}{
+		{
+			name:           "valid_token",
+			serverToken:    authToken,
+			requestToken:   authToken,
+			setHeader:      true,
+			wantStatusCode: http.StatusOK,
+			wantForwarded:  true,
+		},
+		{
+			name:           "missing_token",
+			serverToken:    authToken,
+			setHeader:      false,
+			wantStatusCode: http.StatusUnauthorized,
+		},
+		{
+			name:           "empty_token",
+			serverToken:    authToken,
+			requestToken:   "",
+			setHeader:      true,
+			wantStatusCode: http.StatusUnauthorized,
+		},
+		{
+			name:           "wrong_token",
+			serverToken:    authToken,
+			requestToken:   "wrong-token",
+			setHeader:      true,
+			wantStatusCode: http.StatusUnauthorized,
+		},
+		{
+			name:           "token_prefix",
+			serverToken:    authToken,
+			requestToken:   authToken[:len(authToken)-1],
+			setHeader:      true,
+			wantStatusCode: http.StatusUnauthorized,
+		},
+		{
+			name:           "server_without_token_rejects_all",
+			serverToken:    "",
+			requestToken:   "",
+			setHeader:      true,
+			wantStatusCode: http.StatusUnauthorized,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockRT := &mockRoundTripper{}
+			handler := requireAuthToken(tt.serverToken, newECPProxyHandler(mockRT))
+
+			req := httptest.NewRequest(http.MethodGet, testPath, nil)
+			req.Header.Set(targetHostHeader, "storage.mtls.googleapis.com")
+			if tt.setHeader {
+				req.Header.Set(authTokenHeader, tt.requestToken)
+			}
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, req)
+
+			if rr.Code != tt.wantStatusCode {
+				t.Errorf("requireAuthToken status = %d, want %d", rr.Code, tt.wantStatusCode)
+			}
+			if gotForwarded := mockRT.capturedRequest != nil; gotForwarded != tt.wantForwarded {
+				t.Errorf("requireAuthToken forwarded = %v, want %v", gotForwarded, tt.wantForwarded)
+			}
+			if tt.wantForwarded {
+				if got := mockRT.capturedRequest.Header.Get(authTokenHeader); got != "" {
+					t.Errorf("forwarded request %s header = %q, want it stripped", authTokenHeader, got)
+				}
+			} else {
+				if rr.Header().Get(ecpInternalErrorHeader) == "" {
+					t.Errorf("expected %s header on rejected request", ecpInternalErrorHeader)
+				}
+			}
+		})
+	}
 }
 
 func TestRoutingTransport(t *testing.T) {
@@ -565,13 +692,13 @@ func TestRoutingTransport(t *testing.T) {
 			wantECP: false,
 		},
 		{
-			name:    "non_google_host_with_mtls",
+			name:    "host_containing_mtls",
 			host:    "example.mtls.com",
-			wantECP: false,
+			wantECP: true,
 		},
 		{
-			name:    "non_google_host_starting_with_mtls",
-			host:    "mtls.attacker.com",
+			name:    "host_without_mtls",
+			host:    "google.com",
 			wantECP: false,
 		},
 		{
@@ -606,141 +733,6 @@ func TestRoutingTransport(t *testing.T) {
 	}
 }
 
-func TestIsAllowedHost(t *testing.T) {
-	tests := []struct {
-		name        string
-		host        string
-		wantAllowed bool
-		wantMTLS    bool
-	}{
-		{
-			name:        "standard_mtls_googleapis_host",
-			host:        "storage.mtls.googleapis.com",
-			wantAllowed: true,
-			wantMTLS:    true,
-		},
-		{
-			name:        "regional_mtls_googleapis_host",
-			host:        "us-central1-aiplatform.mtls.googleapis.com",
-			wantAllowed: true,
-			wantMTLS:    true,
-		},
-		{
-			name:        "sandbox_mtls_googleapis_host",
-			host:        "pubsub.mtls.sandbox.googleapis.com",
-			wantAllowed: true,
-			wantMTLS:    true,
-		},
-		{
-			name:        "tpc_mtls_host",
-			host:        "foo.mtls.apis-tpczero.goog",
-			wantAllowed: true,
-			wantMTLS:    true,
-		},
-		{
-			name:        "iap_cloudproxy_mtls_host",
-			host:        "mtls.tunnel.cloudproxy.app",
-			wantAllowed: true,
-			wantMTLS:    true,
-		},
-		{
-			name:        "allowed_mtls_host_with_port_and_mixed_case",
-			host:        "Storage.MTLS.GoogleAPIs.com:443",
-			wantAllowed: true,
-			wantMTLS:    true,
-		},
-		{
-			name:        "standard_non_mtls_googleapis_host",
-			host:        "oauth2.googleapis.com",
-			wantAllowed: true,
-			wantMTLS:    false,
-		},
-		{
-			name:        "artifact_registry_pkg_dev_host",
-			host:        "us-central1-docker.pkg.dev",
-			wantAllowed: true,
-			wantMTLS:    false,
-		},
-		{
-			name:        "bare_gcr_io_host",
-			host:        "gcr.io",
-			wantAllowed: true,
-			wantMTLS:    false,
-		},
-		{
-			name:        "regional_gcr_io_host",
-			host:        "us.gcr.io",
-			wantAllowed: true,
-			wantMTLS:    false,
-		},
-		{
-			name:        "disallowed_non_google_mtls_host",
-			host:        "foo.mtls.invalid:4443",
-			wantAllowed: false,
-			wantMTLS:    false,
-		},
-		{
-			name:        "disallowed_non_google_prefix_mtls_host",
-			host:        "mtls.attacker.com",
-			wantAllowed: false,
-			wantMTLS:    false,
-		},
-		{
-			name:        "disallowed_spoofed_suffix_host",
-			host:        "storage.mtls.googleapis.com.attacker.com",
-			wantAllowed: false,
-			wantMTLS:    false,
-		},
-		{
-			name:        "disallowed_mtls_subdomain_on_allowed_non_mtls_google_domain",
-			host:        "foo.mtls.pkg.dev",
-			wantAllowed: false,
-			wantMTLS:    false,
-		},
-		{
-			name:        "disallowed_mtls_prefix_on_allowed_non_mtls_google_domain",
-			host:        "mtls.googleapis.com",
-			wantAllowed: false,
-			wantMTLS:    false,
-		},
-		{
-			name:        "disallowed_empty_port_suffix",
-			host:        "storage.mtls.googleapis.com:",
-			wantAllowed: false,
-			wantMTLS:    false,
-		},
-		{
-			name:        "disallowed_six_digit_port",
-			host:        "storage.mtls.googleapis.com:123456",
-			wantAllowed: false,
-			wantMTLS:    false,
-		},
-		{
-			name:        "disallowed_loopback_ip",
-			host:        "127.0.0.1:8080",
-			wantAllowed: false,
-			wantMTLS:    false,
-		},
-		{
-			name:        "disallowed_localhost",
-			host:        "localhost:8080",
-			wantAllowed: false,
-			wantMTLS:    false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := isAllowedHost(tt.host); got != tt.wantAllowed {
-				t.Errorf("isAllowedHost(%q) = %v, want %v", tt.host, got, tt.wantAllowed)
-			}
-			if got := isMTLSHost(tt.host); got != tt.wantMTLS {
-				t.Errorf("isMTLSHost(%q) = %v, want %v", tt.host, got, tt.wantMTLS)
-			}
-		})
-	}
-}
-
 func TestRunServer_BindsLoopbackAndRejectsPortInUse(t *testing.T) {
 	// Occupy a free IPv4 loopback port to verify runServer returns an error when the port is already bound.
 	occupiedListener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -757,4 +749,64 @@ func TestRunServer_BindsLoopbackAndRejectsPortInUse(t *testing.T) {
 		t.Fatalf("runServer() on occupied port %d = nil, want non-nil error", occupiedPort)
 	}
 	occupiedListener.Close()
+}
+
+func TestRunServer_BindsOnlyToLoopback(t *testing.T) {
+	// Find a free port.
+	l, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen(127.0.0.1:0) failed: %v", err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+
+	proxyConfig := newDefaultProxyConfig()
+	proxyConfig.Port = port
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errChan := make(chan error, 1)
+	go func() { errChan <- runServer(ctx, proxyConfig, newReadyzHandler("nonce")) }()
+	defer func() {
+		cancel()
+		if err := <-errChan; err != nil {
+			t.Errorf("runServer() returned error: %v", err)
+		}
+	}()
+
+	// The loopback address must be reachable.
+	loopbackAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	var conn net.Conn
+	for i := 0; i < 50; i++ {
+		conn, err = net.DialTimeout("tcp", loopbackAddr, 100*time.Millisecond)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("net.Dial(%s) failed: %v", loopbackAddr, err)
+	}
+	conn.Close()
+
+	// Non-loopback interface addresses must not be reachable.
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Fatalf("net.InterfaceAddrs() failed: %v", err)
+	}
+	checked := 0
+	for _, a := range addrs {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok || ipNet.IP.IsLoopback() || ipNet.IP.To4() == nil {
+			continue
+		}
+		addr := net.JoinHostPort(ipNet.IP.String(), strconv.Itoa(port))
+		if c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond); err == nil {
+			c.Close()
+			t.Errorf("net.Dial(%s) succeeded, want proxy unreachable on non-loopback interfaces", addr)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Log("no non-loopback IPv4 interface addresses found; only verified loopback reachability")
+	}
 }

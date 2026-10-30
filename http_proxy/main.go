@@ -21,6 +21,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -30,8 +31,8 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"os/signal"
-	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -44,6 +45,15 @@ const (
 	// targetHostHeader is the custom HTTP header used by clients to specify the
 	// destination host for the ECPPProxy to forward the request to.
 	targetHostHeader = "x-goog-ecpproxy-target-host"
+	// authTokenHeader is the custom HTTP header that clients must set on every
+	// proxied request. Its value must match the per-process shared secret the
+	// proxy was started with. It is stripped before forwarding.
+	authTokenHeader = "x-goog-ecpproxy-auth-token"
+	// authTokenEnvVar is the environment variable used to pass the per-process
+	// shared secret to the proxy. An environment variable is used instead of a
+	// command-line flag so the secret is not visible to other local users
+	// through the process list.
+	authTokenEnvVar = "ECP_HTTP_PROXY_AUTH_TOKEN"
 	// ecpInternalErrorHeader is a custom HTTP header added to error responses
 	// to indicate that the error originated within the ECPProxy.
 	ecpInternalErrorHeader = "x-goog-ecpproxy-error"
@@ -59,22 +69,16 @@ const (
 	defaultShutdownTimeout     = 5 * time.Second
 )
 
-// allowedMTLSHostsRegex validates whether a target host is an allowed Google mTLS endpoint:
-// - *.mtls.googleapis.com and *.mtls.sandbox.googleapis.com
-// - *.mtls.*.goog (e.g., *.mtls.apis-tpczero.goog, *.mtls.tpczero.goog)
-// - mtls.*.cloudproxy.app (e.g., mtls.tunnel.cloudproxy.app)
-var allowedMTLSHostsRegex = regexp.MustCompile(`^(?:[a-z0-9-]+(?:\.[a-z0-9-]+)*\.mtls(?:\.sandbox)?\.googleapis\.com|[a-z0-9-]+(?:\.[a-z0-9-]+)*\.mtls\.[a-z0-9-]+(?:\.[a-z0-9-]+)*\.goog|mtls\.[a-z0-9-]+(?:\.[a-z0-9-]+)*\.cloudproxy\.app)(?::[0-9]{1,5})?$`)
-
-// allowedNonMTLSHostsRegex validates whether a target host is an allowed non-mTLS Google endpoint
-// for fallback requests routed via DefaultTransport (without client certificate).
-var allowedNonMTLSHostsRegex = regexp.MustCompile(`^(?:[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:googleapis\.com|goog|cloudproxy\.app|pkg\.dev|gcr\.io)|gcr\.io)(?::[0-9]{1,5})?$`)
-
-// AppConfig holds the application configuration parsed from command-line flags.
+// AppConfig holds the application configuration parsed from command-line flags
+// and the environment.
 type AppConfig struct {
 	Port                             int
 	EnterpriseCertificateFilePath    string
 	GcloudConfiguredUpstreamProxyURL string
 	NonceToken                       string
+	// AuthToken is the per-process shared secret that clients must send in the
+	// authTokenHeader on every proxied request. It is read from authTokenEnvVar.
+	AuthToken string
 }
 
 func (cfg *AppConfig) validate() error {
@@ -84,17 +88,23 @@ func (cfg *AppConfig) validate() error {
 	if cfg.NonceToken == "" {
 		return errors.New("nonce_token is required")
 	}
+	if cfg.AuthToken == "" {
+		return fmt.Errorf("%s environment variable is required", authTokenEnvVar)
+	}
 	return nil
 }
 
-// newAppConfigFromFlags parses command-line flags, validates them, and returns a new AppConfig.
+// newAppConfigFromFlags parses command-line flags and the environment, validates
+// them, and returns a new AppConfig.
 func newAppConfigFromFlags() (*AppConfig, error) {
 	cfg := &AppConfig{}
 	flag.IntVar(&cfg.Port, "port", 0, "The port to listen on for HTTP requests. (Required)")
 	flag.StringVar(&cfg.EnterpriseCertificateFilePath, "enterprise_certificate_file_path", "", "The path to the enterprise certificate file.")
 	flag.StringVar(&cfg.GcloudConfiguredUpstreamProxyURL, "gcloud_configured_upstream_proxy_url", "", "The upstream proxy URL configured through gcloud.")
-	flag.StringVar(&cfg.NonceToken, "nonce_token", "", "The nonce token is returned in /readyz endpoint, and can be used to authenticate this server. (Required)")
+	flag.StringVar(&cfg.NonceToken, "nonce_token", "", "The nonce token is returned in /readyz endpoint, and can be used by the parent process to verify this server. (Required)")
 	flag.Parse()
+
+	cfg.AuthToken = os.Getenv(authTokenEnvVar)
 
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -176,20 +186,6 @@ func newTransport(tlsConfig *tls.Config, proxyConfig *ProxyConfig) http.RoundTri
 	return transport
 }
 
-// isMTLSHost checks if the provided host matches the allowed Google mTLS endpoint patterns.
-func isMTLSHost(host string) bool {
-	return allowedMTLSHostsRegex.MatchString(strings.ToLower(host))
-}
-
-// isAllowedHost checks if the provided target host is an allowed Google mTLS or non-mTLS endpoint.
-func isAllowedHost(host string) bool {
-	lowerHost := strings.ToLower(host)
-	if strings.Contains(lowerHost, ".mtls.") || strings.HasPrefix(lowerHost, "mtls.") {
-		return isMTLSHost(lowerHost)
-	}
-	return allowedNonMTLSHostsRegex.MatchString(lowerHost)
-}
-
 // RoutingTransport routes requests to either the ECP mTLS transport or the default
 // transport based on the target host.
 type RoutingTransport struct {
@@ -199,11 +195,10 @@ type RoutingTransport struct {
 
 // RoundTrip executes a single HTTP transaction, routing it to the appropriate transport.
 func (t *RoutingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Route to ECP transport (mTLS) only if the host is an allowed Google mTLS endpoint.
-	// - *.mtls.googleapis.com / *.mtls.sandbox.googleapis.com (e.g., compute.mtls.googleapis.com)
-	// - *.mtls.*.goog (e.g., foo.mtls.apis-tpczero.goog)
-	// - mtls.*.cloudproxy.app (e.g., mtls.tunnel.cloudproxy.app)
-	if isMTLSHost(req.URL.Host) {
+	// Route to ECP transport (mTLS) if the host is an mTLS endpoint.
+	// - Contains ".mtls." matches standard Google API mTLS hosts (e.g., compute.mtls.googleapis.com).
+	// - Starts with "mtls." matches IAP tunnel WebSocket hosts (e.g., mtls.tunnel.cloudproxy.app).
+	if strings.Contains(req.URL.Host, ".mtls.") || strings.HasPrefix(req.URL.Host, "mtls.") {
 		return t.ECPTransport.RoundTrip(req)
 	}
 	return t.DefaultTransport.RoundTrip(req)
@@ -247,13 +242,26 @@ func newECPProxyHandler(transport http.RoundTripper) http.Handler {
 			writeError(w, fmt.Errorf("missing %s header", targetHostHeader), "Bad Request", http.StatusBadRequest)
 			return
 		}
-		if !isAllowedHost(targetHost) {
-			writeError(w, fmt.Errorf("target host %q is not allowed", targetHost), "Forbidden", http.StatusForbidden)
-			return
-		}
 
 		// If validation passes, let the ReverseProxy handle the request.
 		proxy.ServeHTTP(w, r)
+	})
+}
+
+// requireAuthToken wraps next so that it only receives requests carrying the
+// expected per-process shared secret in authTokenHeader. Requests with a missing
+// or mismatched token are rejected with 401 Unauthorized. The header is removed
+// before calling next so it is never forwarded to the target host.
+func requireAuthToken(authToken string, next http.Handler) http.Handler {
+	expected := []byte(authToken)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got := []byte(r.Header.Get(authTokenHeader))
+		if len(expected) == 0 || subtle.ConstantTimeCompare(got, expected) != 1 {
+			writeError(w, fmt.Errorf("missing or invalid %s header", authTokenHeader), "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		r.Header.Del(authTokenHeader)
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -269,9 +277,10 @@ func newReadyzHandler(nonceToken string) http.Handler {
 	})
 }
 
-// newRouter creates the top-level HTTP router that serves /readyz for local
-// readiness checks (without a targetHostHeader) and forwards all other requests
-// to the ECP proxy handler.
+// newRouter creates the top-level HTTP router. It serves /readyz (without a
+// targetHostHeader) unauthenticated so the parent process can verify the server
+// via the nonce token, and forwards all other requests to the ECP proxy handler,
+// which must be wrapped with requireAuthToken by the caller.
 func newRouter(readyz, ecpProxy http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/readyz" && r.Header.Get(targetHostHeader) == "" {
@@ -283,47 +292,33 @@ func newRouter(readyz, ecpProxy http.Handler) http.Handler {
 }
 
 // runServer starts the HTTP server with the given handler and configuration.
-// It binds explicitly to the loopback interfaces (127.0.0.1 and ::1) and listens
-// for OS signals from the provided context to perform a graceful shutdown.
+// It binds explicitly to the IPv4 loopback interface (127.0.0.1) so the proxy
+// is never reachable from external network interfaces, and listens for OS
+// signals from the provided context to perform a graceful shutdown.
 func runServer(ctx context.Context, proxyConfig *ProxyConfig, handler http.Handler) error {
-	ipv4Addr := fmt.Sprintf("127.0.0.1:%d", proxyConfig.Port)
-	ipv6Addr := fmt.Sprintf("[::1]:%d", proxyConfig.Port)
+	addr := fmt.Sprintf("127.0.0.1:%d", proxyConfig.Port)
 
 	server := &http.Server{
-		Addr:    ipv4Addr,
+		Addr:    addr,
 		Handler: handler,
 	}
 
-	ipv4Listener, err := net.Listen("tcp4", ipv4Addr)
+	listener, err := net.Listen("tcp4", addr)
 	if err != nil {
-		return fmt.Errorf("starting proxy server on %s: %w", ipv4Addr, err)
+		return fmt.Errorf("starting proxy server on %s: %w", addr, err)
 	}
-	defer ipv4Listener.Close()
+	defer listener.Close()
 
-	// Channel to receive errors from the server's Serve goroutines.
-	errChan := make(chan error, 2)
+	// Channel to receive errors from the server's Serve goroutine.
+	errChan := make(chan error, 1)
 
-	// Run the IPv4 loopback server in a goroutine.
+	// Run the server in a goroutine.
 	go func() {
-		logger.Infof("Starting proxy server on %s", ipv4Addr)
-		if err := server.Serve(ipv4Listener); err != http.ErrServerClosed {
-			errChan <- fmt.Errorf("starting proxy server on %s: %w", ipv4Addr, err)
+		logger.Infof("Starting proxy server on %s", addr)
+		if err := server.Serve(listener); err != http.ErrServerClosed {
+			errChan <- fmt.Errorf("starting proxy server on %s: %w", addr, err)
 		}
 	}()
-
-	// Also bind to IPv6 loopback (::1) when available so localhost resolution
-	// to ::1 works while never binding to 0.0.0.0 or ::.
-	if ipv6Listener, err := net.Listen("tcp6", ipv6Addr); err == nil { // if NO error
-		defer ipv6Listener.Close()
-		go func() {
-			logger.Infof("Starting proxy server on %s", ipv6Addr)
-			if err := server.Serve(ipv6Listener); err != http.ErrServerClosed {
-				errChan <- fmt.Errorf("starting proxy server on %s: %w", ipv6Addr, err)
-			}
-		}()
-	} else {
-		logger.Infof("IPv6 loopback listener on %s not started: %v", ipv6Addr, err)
-	}
 
 	// Block until we receive an error or a shutdown signal from the context.
 	select {
@@ -392,7 +387,7 @@ func run(ctx context.Context, cfg *AppConfig) error {
 
 	// Create the individual handlers
 	readyz := newReadyzHandler(cfg.NonceToken)
-	ecpProxy := newECPProxyHandler(routingTransport)
+	ecpProxy := requireAuthToken(cfg.AuthToken, newECPProxyHandler(routingTransport))
 	router := newRouter(readyz, ecpProxy)
 
 	// Run the server
